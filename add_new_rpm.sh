@@ -54,7 +54,7 @@ AVAILABLE_PLATFORMS=(
     'el7'
 )
 
-CONFIRM_PROMPT="Continue? (y/yes): confirm (s/skip): skip (q/quit): cancel"
+CONFIRM_PROMPT="Continue? (y/yes): confirm | (s/skip): skip | (q/quit): cancel"
 CONFIRM_CHOICE=''
 
 # ---   Function Definitions   --- #
@@ -526,7 +526,7 @@ if FLAG_SET 'directory'; then
         SET_FLAG 'allplatform' "${PLATFORM_FLAG}";
     fi
 
-    if VERBOSE; then echo "Searching directory for files..."; fi
+    PRINT_VERBOSE echo "Searching directory for files..."
 
     if FLAG_SET 'recursive'; then
         found_files=$(find "${DIRECTORY_FLAG}" -type f -name "*.rpm")
