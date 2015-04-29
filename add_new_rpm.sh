@@ -20,8 +20,10 @@
 # ---   Global Configuration   --- #
 
 BASE_REPO_DIR='/var/www/html/dimenoc'
+#BASE_REPO_DIR='/tmp'
 EL_REPO_DIR="${BASE_REPO_DIR}/centos"
 BACKUPDIR=
+BACKUP_RPM_LIST=''
 UPDATEDIRS=
 EXPECT_BIN='/usr/bin/expect'
 
@@ -37,12 +39,12 @@ FLAGS=(
     'allplatform'
     'arch'
     'backup'
-    'confirm'
+    'interactive'
     'directory'
     'force'
     'nosign'
     'platform'
-    'sign'
+    'resign'
     'recursive'
     'verbose'
 )
@@ -86,20 +88,28 @@ and the second form will add any .rpm files found in DIRECTORY.
 
 Mandatory arguments to long options are mandatory for short options too.
 
-Options
+Global Options
     -h, --help                  prints help menu
     -f, --force                 Do not prompt before overwriting any pre-existing
+    -i, --interactive           prompt before any move or copy operations
                                 packages with the same name/version in repo
         --backup[=DIRECTORY]    save overwritten packages. If DIRECTORY is
                                 specified then any saved packages will be placed
                                 there, otherwise, the package will simply be copied
                                 with a .bak suffix
-    -c                          confirm before uploading rpm
     -v, --verbose               runs script in verbose mode (you can increase
                                 the verbosity by adding multiple 'v' characters,
                                 up to a maximum of 3)
 
-Repo Options
+Directory Options
+    -d, --directory=DIRECTORY   specify the directory to search for .rpm files
+    -r, --recursive             recursively perform search
+
+Signing Options
+    --resign                    force a resigning of all RPM packages
+    --nosign                    skip the entire signing process
+
+Upload Options
     -a ARCH                     specify the architecture for the following FILE or
                                 DIRECTORY argument(s). Valid values are:
                                     i386
@@ -127,10 +137,13 @@ Repo Options
     --allplatform=PLATFORM      apply the platform PLATFORM to any following FILE or
                                 DIRECTORY argument(s)
 
-Directory Mode Options
-    -d, --directory=DIRECTORY   specify the directory to search for .rpm files
-    -r, --recursive             recursively perform search
 "
+}
+
+function EXIT_INFO() {
+    if [ ! -z "${1}" ]; then echo "${1}"; fi
+    echo "Try 'add_new_rpm.sh --help' for more information"
+    exit 1
 }
 
 function ABORT_SCRIPT() {
@@ -377,15 +390,41 @@ function PRINT_FILE_LIST() {
 
 function sign_rpms_expect_script() {
 passphrase="${1}"
-shift
+rpm_files="${@:2}"
+#echo "rpm_files: '${rpm_files}'"
 cat <<EOF
-spawn rpm --resign ${@}
+set warning 0
+spawn rpm --resign $rpm_files
 expect -exact "Enter pass phrase: "
 send -- "${passphrase}\r"
 expect {
-    "gpg: signing failed" { exit 1 }
-    eof { exit 0 }
+        "gpg: signing failed" { exit 2 }
+        "warning:" {
+            expect {
+                eof { exit 1 }
+            }
+        }
+        eof { exit 0 }
 }
+EOF
+}
+
+function sign_rpms_expect_script2() {
+passphrase="${1}"
+rpm_files="${@:2}"
+#echo "rpm_files: '${rpm_files}'"
+cat <<EOF
+set warning 0
+spawn rpm --resign $rpm_files
+expect -exact "Enter pass phrase: "
+send -- "${passphrase}\r"
+while { 1 } {
+    expect {
+        "warning:" { puts "TESTING"; continue }
+        eof { break }
+    }
+}
+exit 0
 EOF
 }
 
@@ -395,22 +434,51 @@ function SIGN_RPMS() {
     done
 
     # Perform simple 'naive' check to see if signature is necessary
-    unsigned_rpms="$( rpm -K ${rpms_to_sign} | grep -v -e "[gG][pP][gG]" )"
-    if [ -z "${unsigned_rpms}" ]; then
-        echo "All packages are signed!"
-        return 0
+    if FLAG_SET 'resign'; then
+        unsigned_rpms="${rpms_to_sign}"
+    else
+        unsigned_rpms="$( rpm -K ${rpms_to_sign} | grep -v -e "[gG][pP][gG]" | cut -d ':' -f1 )"
+        if [ -z "${unsigned_rpms}" ]; then
+            echo "All packages are signed!"
+            return 0
+        fi
+        echo "There are unsigned packages!"
     fi
 
-    echo "There are unsigned packages!"
+    PRINT_VERBOSE "-----------------------"
+    PRINT_VERBOSE "${unsigned_rpms}"
+    PRINT_VERBOSE "-----------------------"
+
     echo -n "Please enter passphrase to sign packages: "
     read rpm_passphrase
 
-    echo "Signing RPM Package(s)..."
-    sign_rpms_expect_script | ${EXPECT_BIN} -f -
+    echo -n "Signing RPM Package(s)..."
+    cmd_results="$( sign_rpms_expect_script "${rpm_passphrase}" "$(echo -n ${unsigned_rpms} | tr -d '\n' )" | ${EXPECT_BIN} -f - )"
+    case ${?} in
+        2 ) PRINT_ERROR "-- Bad passphrase"
+            echo "Aborting Script..."
+            exit 1
+            ;;
+
+        1 ) PRINT_WARN
+            echo "${cmd_results}" | grep "warning:"
+            echo ""
+            ;;
+
+        0 ) PRINT_SUCCESS
+            ;;
+
+        * ) ;;
+    esac
     return 0;
 }
 
 function ADD_RPM_TO_FILE_LIST() {
+    if [ ! -f "${1}" ]; then
+        PRINT_WARN "- '${1}' is not a valid filename! Skipping..."
+        return 0
+    fi
+
     PRINT_VERBOSE "Adding RPM '${1}' to FILE_LIST..." 2
     arch=''
     platform=''
@@ -472,6 +540,7 @@ function ADD_RPM_TO_FILE_LIST() {
         fi
     fi
 
+    PRINT_VERBOSE "Arch - ${arch}\nPlatform - ${platform}"
     FILE_LIST=$(echo "${FILE_LIST}" "${arch},${platform},${1}")
 }
 
@@ -482,14 +551,17 @@ function ADD_RPM_TO_ELREPO() {
         arch="${1}"
         platform="${2}"
         filename="${3}"
+        pkg_name="${filename/#*\//}"
     fi
 
     upload_folder="${EL_REPO_DIR}/${platform/#el/}/${arch}"
-    echo "Preparing to upload RPM: ${filename}"
+    echo "Package: ${pkg_name}"
+    echo "Platform:       ${platform}"
+    echo "Architecture:   ${arch}"
 
     # First perform any backups if necessary
     if FLAG_SET 'backup'; then
-        if ! BACKUP_RPM "${upload_folder}/${filename/#*\//}"; then return 1; fi
+        if ! BACKUP_RPM "${upload_folder}/${pkg_name}"; then return 1; fi
     fi
 
     # Put the .rpm in the upload folder
@@ -498,59 +570,44 @@ function ADD_RPM_TO_ELREPO() {
         ABORT_SCRIPT
     fi
 
-    echo -en "Uploading to directory..."
+    printf "Copy to repo\t"
     if cp ${FORCE_FLAG} "${filename}" "${upload_folder}/"; then
         # Add directory to list of dirs to call createrepo on
         UPDATEDIRS+="${upload_folder} "
-        PRINT_SUCCESS
+        PRINT_SUCCESS "\n"
         return 0;
     else
-        PRINT_ERROR "- Skipping"
+        PRINT_ERROR "- 'cp' returned error! Skipping RPM...\n"
         return 1;
     fi
 }
 
 function BACKUP_RPM() {
-    echo -n "Backing up RPM..."
     if [ $# -ne 1 ]; then
         return 1
     else
         old_rpm="${1}"
     fi
 
+    printf "Create backup\t"
     if [ ! -f "${old_rpm}" ]; then
-        PRINT_INFO "- Skipping (No backup required)"
+        PRINT_INFO "- (Backup not required)"
         return 0;
 
     # Default backup methodology (just cp with .bak)
     elif [ -z "${BACKUPDIR}" ]; then
-            mv "${FORCE_FLAG}" "${old_rpm}"{,.bak}
+        target="${old_rpm}.bak"
     # Backup files to dir
     else
-        if [ ! -d "${BACKUPDIR}" ]; then
-            echo -en "\nBackup directory '${BACKUPDIR}' doesn't exist. Do you want to create it? (y/n) "
-            GET_CONFIRMATION 1 'no_prompt'
-            case "${CONFIRM_CHOICE}" in
-                'yes' ) if ! mkdir -p "${BACKUPDIR}"; then
-                            PRINT_ERROR "Unable to create directory: ${BACKUPDIR}"
-                            ABORT_SCRIPT
-                        fi;;
-                'no' )  PRINT_ERROR "Backup directory doesn't exist!"
-                        ABORT_SCRIPT;;
-                * ) ;;
-            esac
-        fi
-
-        # Move RPM to dir
-        PRINT_VERBOSE "Backing up RPMs to directory: ${BACKUPDIR}" 2
-        mv "${FORCE_FLAG}" "${old_rpm}" "${BACKUPDIR}/"
+        target="${BACKUPDIR}/${old_rpm/#*\//}";
     fi
 
-    if [ $? -eq 0 ]; then
+    if mv ${FORCE_FLAG} "${old_rpm}" "${target}"; then
         PRINT_SUCCESS
+        PRINT_VERBOSE "Backup at: ${target}"
         return 0
     else
-        PRINT_ERROR " - Unable to move old package!"
+        PRINT_ERROR ": Unable to create backup for '${old_rpm}'. Skipping RPM..."
         return 1
     fi
 }
@@ -560,16 +617,31 @@ function UPDATE_ELREPO() {
         return 1
     fi
 
-    dirs_to_update=$( echo "${1}" | sed -r 's/ /\n/g' | sort | uniq );
-    for directory in "${dirs_to_update}"; do
-        echo "Updating directory: ${directory}"
+    update_repodata_dirs=$( echo "${1}" | sed -r 's/ /\n/g' | sort | uniq );
+    error_output=''
+    retval=0
+
+    # el4/5 distros require sha1 hash
+    for directory in ${update_repodata_dirs}; do
+        PRINT_VERBOSE "Updating: ${directory}"
+        case "${directory}" in
+            "${EL_REPO_DIR}/4/"* | "${EL_REPO_DIR}/5/"* ) hash='sha1';;
+            "${EL_REPO_DIR}/6/"* | "${EL_REPO_DIR}/7/"* ) hash='sha';;
+        esac
+
+        error_output="$( createrepo -s "${hash}" ${directory} 2>&1 > /dev/null )"
+        if [ $? -ne 0 ]; then
+            PRINT_ERROR ": Unable to update repodata for - ${directory}"
+            echo "STDERR: '${error_output}'"
+            retval=1
+        fi
     done
 
-    return 0
+    return ${retval};
 }
 
 # ---     Parse Arguments      --- #
-
+SET_FLAG 'force' '-u'
 while [ $# -gt 0 ]; do
     option=$1
     PRINT_VERBOSE "Option: ${option} " 2
@@ -593,19 +665,35 @@ while [ $# -gt 0 ]; do
         '--backup='* )
             BACKUPDIR=$( echo "${option}" | cut -d '=' -f2 )
             if FLAG_SET 'backup'; then
-                echo "Cannot specify multiple backup flags!"
-                show_usage
-                exit 1;
+                EXIT_INFO "Cannot specify multiple backup flags!"
             elif [ -z "${BACKUPDIR}" ]; then
-                echo "No directory argument passed to --backup="
-                echo "Try: 'add_new_rpm.sh --help' for more information"
-                exit 1;
+                EXIT_INFO "No directory argument passed to backup flag!"
+            else
+                if [ ! -d "${BACKUPDIR}" ]; then
+                    echo -en "Backup directory '${BACKUPDIR}' doesn't exist. Do you want to create it? (y/n) "
+                    read create_backupdir
+                    case "${create_backupdir}" in
+                    [yY] | [yY][eE][sS] ) if ! mkdir -p "${BACKUPDIR}"; then
+                                PRINT_ERROR "Unable to create directory: ${BACKUPDIR}"
+                                ABORT_SCRIPT
+                            fi
+                        ;;
+
+                    [nN] | [nN][oO] )  echo "Backup directory must exist before execution"
+                            ABORT_SCRIPT
+                        ;;
+
+                    * ) PRINT_ERROR "- Invalid Choice! Try running again"
+                        ABORT_SCRIPT
+                        ;;
+                    esac
+                fi
             fi
-            SET_FLAG 'backup' "${backupdir}"
+            SET_FLAG 'backup' "${BACKUPDIR}"
             ;;
 
-        '-c' )
-            SET_FLAG 'confirm' 'yes'
+        '-i' | '--interactive' )
+            SET_FLAG 'interactive' 'yes'
             SET_FLAG 'force' '-i'
             ;;
 
@@ -619,22 +707,18 @@ while [ $# -gt 0 ]; do
 
 # Repo Options
         '--nosign' )
-                if FLAG_NOT_SET 'sign'; then
+                if FLAG_NOT_SET 'resign'; then
                     SET_FLAG 'nosign'
                 else
-                    echo "Already specified '--sign' flag!"
-                    echo "Try 'add_new_rpm.sh --help' for more information"
-                    exit 1
+                    EXIT_INFO "Already specified '--sign' flag!"
                 fi
                 ;;
 
-        '--sign' )
+        '--resign' )
                 if FLAG_NOT_SET 'nosign'; then
-                    SET_FLAG 'sign'
+                    SET_FLAG 'resign'
                 else
-                    echo "Already specified '--nosign' flag!"
-                    echo "Try 'add_new_rpm.sh --help' for more information"
-                    exit 1
+                    EXIT_INFO "Already specified '--nosign' flag!"
                 fi
                 ;;
 
@@ -805,27 +889,23 @@ if FLAG_NOT_SET 'nosign'; then
     SIGN_RPMS
 fi
 
-exit 0
-
 # Go through each RPM and upload it to the proper directory
+PRINT_VERBOSE "Upload Directory Root: ${EL_REPO_DIR}"
+echo -e "Uploading RPM(s) to Repo Directory...\n"
 for entry in ${FILE_LIST[@]}; do
     read arch platform filename <<< $(echo "${entry}" | column -t -s ',')
-    if FLAG_SET 'confirm'; then
-        GET_CONFIRMATION 2
-        case "${CONFIRM_CHOICE}" in
-            'yes' ) ;;
-            'skip') echo "Skipping..." ; continue ;;
-            'quit') echo -e "\nAborting Script! If any of the details were incorrect please"
-                    echo "try 'add_new_rpm.sh --help' for more information on available options"
-                    exit 0
-                    ;;
-        esac
-    fi
     ADD_RPM_TO_ELREPO "${arch}" "${platform}" "${filename}"
 done
 
-if UPDATE_ELREPO "${UPDATEDIRS}"; then
+if FLAG_SET 'backup'; then echo -e "\nBackup RPM(s) created:\n${BACKUP_RPM_LIST}"; fi
+
+# Update directories that require updating
+echo "Updating repodata for directories..."
+if ! UPDATE_ELREPO "${UPDATEDIRS}"; then
+    PRINT_WARN ": Script finished with errors!"
     exit 1
 fi
 
+echo "No errors reported"
+echo "Script Exited Successfully!"
 exit 0
